@@ -267,51 +267,84 @@ LogicalResult OperationVerifier::verifyOnExit(Operation &op) {
 /// Such ops are collected separately and verified inside
 /// verifyBlockPostChildren.
 LogicalResult OperationVerifier::verifyOperation(Operation &op) {
-  SmallVector<WorkItem> worklist{{&op}};
-  DenseSet<WorkItem> seen;
+  struct Item {
+    /// Block currently verifying.
+    Block *block;
+
+    /// Operation to consider verifying.
+    Block::iterator curOp;
+
+    /// Has `curOp` been visited (entrance, children enqueued)?
+    bool opVisited;
+
+    /// Has `block` been visited (entrance)?
+    bool blockVisited;
+  };
+
+  if (failed(verifyOnEntrance(op)))
+    return failure();
+
+  // Early exit if not verifying recursively.
+  if (!verifyRecursively)
+    return verifyOnExit(op);
+
+  SmallVector<Item> worklist;
+
+  // Helper to add worklist items for all contained blocks.
+  auto enqueueChildren = [&worklist](Operation &op) {
+    for (Region &region : llvm::reverse(op.getRegions()))
+      for (Block &block : llvm::reverse(region))
+        worklist.push_back(Item{&block, block.begin(), false, false});
+  };
+
+  enqueueChildren(op);
+
+  // Process worklist of blocks and their operations.
   while (!worklist.empty()) {
-    WorkItem top = worklist.back();
+    auto &item = worklist.back();
+    auto &block = *item.block;
 
-    auto visit = [](auto &&visitor, WorkItem w) {
-      if (w.is<Operation *>())
-        return visitor(w.get<Operation *>());
-      return visitor(w.get<Block *>());
-    };
-
-    const bool isExit = !seen.insert(top).second;
-    // 2nd visit of this work item ("exit").
-    if (isExit) {
-      worklist.pop_back();
-      if (failed(visit(
-              [this](auto *workItem) { return verifyOnExit(*workItem); }, top)))
+    // Visit block if haven't already.
+    if (!item.blockVisited) {
+      if (failed(verifyOnEntrance(block)))
         return failure();
+      item.blockVisited = true;
+    }
+
+    // Second time visiting this operation.
+    // Children have been visited.
+    if (item.opVisited) {
+      if (failed(verifyOnExit(*item.curOp)))
+        return failure();
+      item.opVisited = false;
+      ++item.curOp;
+    }
+
+    // Current op has not been visited, advance until find one to process.
+    while (item.curOp != block.end() &&
+        item.curOp->getNumRegions() != 0 &&
+        item.curOp->hasTrait<OpTrait::IsIsolatedFromAbove>())
+      ++item.curOp;
+
+    // If no operations left to verify, done with this block.
+    if (item.curOp == block.end()) {
+      if (failed(verifyOnExit(block)))
+        return failure();
+
+      worklist.pop_back();
       continue;
     }
 
-    // 1st visit of this work item ("entrance").
-    if (failed(visit(
-            [this](auto *workItem) { return verifyOnEntrance(*workItem); },
-            top)))
+    // Proceess the op and mark visited.
+    if (failed(verifyOnEntrance(*item.curOp)))
       return failure();
+    item.opVisited = true;
 
-    if (top.is<Block *>()) {
-      Block &currentBlock = *top.get<Block *>();
-      // Skip "isolated from above operations".
-      for (Operation &o : llvm::reverse(currentBlock)) {
-        if (o.getNumRegions() == 0 ||
-            !o.hasTrait<OpTrait::IsIsolatedFromAbove>())
-          worklist.emplace_back(&o);
-      }
-      continue;
-    }
-
-    Operation &currentOp = *top.get<Operation *>();
-    if (verifyRecursively)
-      for (Region &region : llvm::reverse(currentOp.getRegions()))
-        for (Block &block : llvm::reverse(region))
-          worklist.emplace_back(&block);
+    // Add the operation's blocks to the worklist.
+    enqueueChildren(*item.curOp);
   }
-  return success();
+
+  return verifyOnExit(op);
 }
 
 //===----------------------------------------------------------------------===//
